@@ -4,12 +4,18 @@ import pytest
 import torch
 
 import torch_sim as ts
+from tests.conftest import DEVICE, DTYPE
 from torch_sim.autobatching import (
     BinningAutoBatcher,
     InFlightAutoBatcher,
+    MemoryModel,
     _n_edges_scalers,
+    _nonnegative_least_squares,
+    _per_copy_cost_mib,
+    _reference_systems,
     calculate_memory_scalers,
     determine_max_batch_size,
+    fit_memory_model,
     to_constant_volume_bins,
 )
 from torch_sim.models.lennard_jones import LennardJonesModel
@@ -1014,3 +1020,156 @@ def test_binning_auto_batcher_with_lbfgs(
         all_finished_states.extend(batch.split())
 
     assert len(all_finished_states) == len(lbfgs_states)
+
+
+def _molecules_state(device: torch.device = DEVICE) -> ts.SimState:
+    """Isolated molecules from 3 to 60 atoms, like a mixed molecular library."""
+    from ase.build import molecule
+
+    names = ["H2O", "CH4", "C6H6", "CH3CH2OH", "C60", "NH3"]
+    return ts.io.atoms_to_state([molecule(n) for n in names], device=device, dtype=DTYPE)
+
+
+def _mock_measurements(
+    monkeypatch: pytest.MonkeyPatch,
+    const: float,
+    per_atom: float,
+    per_edge: float,
+    *,
+    batch_fixed: float = 0.0,
+    free_mib: float = 1000.0,
+) -> None:
+    """Make per-copy measurements follow an exact affine memory model."""
+
+    def per_copy(state: ts.SimState, *_args: Any) -> tuple[float, float]:
+        n_edges = _n_edges_scalers(state, 6.0)[0]
+        return const + per_atom * state.n_atoms + per_edge * n_edges, batch_fixed
+
+    monkeypatch.setattr("torch_sim.autobatching._per_copy_cost_mib", per_copy)
+    monkeypatch.setattr("torch_sim.autobatching._free_device_mib", lambda _: free_mib)
+
+
+def test_nonnegative_least_squares_recovers_and_clamps() -> None:
+    design = torch.tensor(
+        [[1.0, 3, 6], [1, 12, 120], [1, 9, 72], [1, 60, 1800]], dtype=torch.float64
+    )
+    exact = torch.tensor([30.0, 1.0, 0.2], dtype=torch.float64)
+    torch.testing.assert_close(_nonnegative_least_squares(design, design @ exact), exact)
+
+    negative = torch.tensor([30.0, -1.0, 0.2], dtype=torch.float64)
+    assert (_nonnegative_least_squares(design, design @ negative) >= 0).all()
+
+
+def test_fit_memory_model_recovers_affine_cost(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_measurements(monkeypatch, 26.0, 1.0, 0.2, batch_fixed=50.0)
+    memory_model, budget = fit_memory_model(
+        _molecules_state(), model=None, max_memory_padding=0.8
+    )
+    assert memory_model.const == pytest.approx(26.0, rel=1e-6)
+    assert memory_model.per_atom == pytest.approx(1.0, rel=1e-6)
+    assert memory_model.per_edge == pytest.approx(0.2, rel=1e-6)
+    assert budget == pytest.approx((1000.0 - 50.0) * 0.8)
+
+
+def test_fit_memory_model_never_undershoots_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Costs no affine model fits exactly must still be covered at every reference."""
+    state = _molecules_state()
+
+    def per_copy(ref: ts.SimState, *_args: Any) -> tuple[float, float]:
+        return 5.0 * ref.n_atoms**1.5, 0.0  # superlinear, not affine
+
+    monkeypatch.setattr("torch_sim.autobatching._per_copy_cost_mib", per_copy)
+    monkeypatch.setattr("torch_sim.autobatching._free_device_mib", lambda _: 1e6)
+    memory_model, _ = fit_memory_model(state, model=None)
+
+    predicted = memory_model.predict(state)
+    for idx in _reference_systems(
+        state.n_atoms_per_system.double(),
+        torch.tensor(_n_edges_scalers(state, 6.0), dtype=torch.float64),
+    ):
+        assert predicted[idx] >= 5.0 * int(state.n_atoms_per_system[idx]) ** 1.5 - 1e-6
+
+
+def test_binning_measured_fits_small_and_large_systems(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: a large per-system constant must not cap the budget below a system.
+
+    With a proportional metric, the smallest system's probe made every edge look
+    expensive and set max_memory_scaler below the largest system's metric.
+    """
+    _mock_measurements(monkeypatch, 30.0, 1.0, 0.2, free_mib=2000.0)
+    state = _molecules_state()
+    batcher = BinningAutoBatcher(model=None, memory_scales_with="measured")
+    budget = batcher.load_states(state)
+
+    assert isinstance(batcher.memory_scales_with, MemoryModel)
+    assert max(batcher.memory_scalers) <= budget
+    for index_bin in batcher.index_bins:
+        assert sum(batcher.memory_scalers[i] for i in index_bin) <= budget
+
+
+def test_measured_keeps_user_max_memory_scaler(monkeypatch: pytest.MonkeyPatch) -> None:
+    _mock_measurements(monkeypatch, 30.0, 1.0, 0.2, free_mib=2000.0)
+    batcher = BinningAutoBatcher(
+        model=None, memory_scales_with="measured", max_memory_scaler=1500.0
+    )
+    assert batcher.load_states(_molecules_state()) == 1500.0
+
+
+def test_in_flight_measured_rejects_iterator() -> None:
+    batcher = InFlightAutoBatcher(model=None, memory_scales_with="measured")
+    with pytest.raises(ValueError, match="up front"):
+        batcher.load_states(iter(_molecules_state().split()))
+
+
+def test_unfitted_measured_metric_raises(benzene_sim_state: ts.SimState) -> None:
+    with pytest.raises(ValueError, match="fitted first"):
+        calculate_memory_scalers(benzene_sim_state, memory_scales_with="measured")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_fit_memory_model_on_device() -> None:
+    """Smoke test of the real measurement path."""
+    state = _molecules_state(torch.device("cuda"))
+    lj_model = LennardJonesModel(
+        sigma=3.405, epsilon=0.0104, device=torch.device("cuda"), dtype=DTYPE
+    )
+    memory_model, budget = fit_memory_model(state, lj_model, max_memory_padding=0.5)
+    assert min(memory_model.const, memory_model.per_atom, memory_model.per_edge) >= 0
+    assert 0 < budget < torch.cuda.mem_get_info()[1] / 1024**2
+    assert all(cost > 0 for cost in memory_model.predict(state))
+
+
+@pytest.mark.parametrize("oom_above_mib", [None, 3000.0])
+def test_per_copy_cost_resolves_small_slope_under_large_fixed_cost(
+    monkeypatch: pytest.MonkeyPatch, oom_above_mib: float | None
+) -> None:
+    """Regression: a large fixed batch cost hid a tiny system's per-copy cost.
+
+    Sizing the second batch from one copy's total picked ~3 copies, so a 25 MiB
+    per-copy cost under ~1 GiB of fixed cost was measured as noise.
+    """
+    fixed, per_copy = 1000.0, 25.0
+    calls = []
+
+    def fake_measure(state: ts.SimState, _model: Any) -> float:
+        calls.append(state.n_systems)
+        jitter = 10.0 if len(calls) % 2 else -10.0  # allocator noise
+        mib = fixed + per_copy * state.n_systems + jitter
+        if oom_above_mib is not None and mib > oom_above_mib:
+            raise RuntimeError("CUDA out of memory")
+        return mib / 1024
+
+    monkeypatch.setattr(
+        "torch_sim.autobatching.measure_model_memory_forward", fake_measure
+    )
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *_: 0)
+    state = _molecules_state()[0]
+    measured, batch_fixed = _per_copy_cost_mib(
+        state, None, 14_000.0, 100_000, ["CUDA out of memory"]
+    )
+    assert measured == pytest.approx(per_copy, rel=0.05)
+    assert batch_fixed == pytest.approx(fixed, rel=0.05)

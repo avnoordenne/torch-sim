@@ -17,7 +17,11 @@ import torch
 from tqdm import tqdm
 
 import torch_sim as ts
-from torch_sim.autobatching import BinningAutoBatcher, InFlightAutoBatcher
+from torch_sim.autobatching import (
+    BinningAutoBatcher,
+    InFlightAutoBatcher,
+    _fit_measured_memory_model,
+)
 from torch_sim.integrators import INTEGRATOR_KWARG_UNITS, INTEGRATOR_REGISTRY, Integrator
 from torch_sim.integrators.md import MDState
 from torch_sim.models.interface import ModelInterface
@@ -718,6 +722,8 @@ def optimize[T: OptimState](  # noqa: C901, PLR0915
         initial_state, model, autobatcher=autobatcher, max_iterations=max_iterations
     )
 
+    # Fit once so the chunked init pass and the optimization share one memory model.
+    _fit_measured_memory_model(autobatcher, initial_state)
     if isinstance(initial_state, OptimState):
         state = initial_state
     else:
@@ -732,7 +738,9 @@ def optimize[T: OptimState](  # noqa: C901, PLR0915
             init_kwargs=dict(**init_kwargs or {}),
             max_memory_scaler=autobatcher.max_memory_scaler,
             memory_scales_with=autobatcher.memory_scales_with,
+            cutoff=autobatcher.cutoff,
             max_atoms_to_try=autobatcher.max_atoms_to_try,
+            memory_scaling_factor=autobatcher.memory_scaling_factor,
             oom_error_message=autobatcher.oom_error_message,
             max_memory_padding=autobatcher.max_memory_padding,
         )
