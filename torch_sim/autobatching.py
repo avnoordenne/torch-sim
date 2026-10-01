@@ -21,9 +21,12 @@ Notes:
 """
 
 import logging
+import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
-from itertools import chain
-from typing import Any, get_args
+from dataclasses import dataclass
+from itertools import chain, combinations
+from typing import Any, Literal, get_args
 
 import torch
 
@@ -187,9 +190,38 @@ def measure_model_memory_forward(state: SimState, model: ModelInterface) -> floa
     torch.cuda.ipc_collect()
     torch.cuda.reset_peak_memory_stats()
 
-    model(state)
+    # Kernels that allocate outside PyTorch's caching allocator (the Warp memory
+    # pool behind nvalchemiops neighbor lists and D3, cudaMallocManaged) are
+    # invisible to max_memory_allocated, so also track the device's free memory.
+    device = state.device
+    allocated_before = torch.cuda.memory_allocated(device)
+    free_before = torch.cuda.mem_get_info(device)[0]
+    stop, lowest_free = threading.Event(), []
+    poller = threading.Thread(
+        target=_poll_lowest_free_memory, args=(device, stop, lowest_free), daemon=True
+    )
+    poller.start()
+    try:
+        model(state)
+        torch.cuda.synchronize()
+    finally:
+        stop.set()
+        poller.join()
 
-    return torch.cuda.max_memory_allocated() / 1024**3  # Convert to GB
+    torch_peak = torch.cuda.max_memory_allocated(device)
+    device_peak = allocated_before + free_before - lowest_free[0]
+    return max(torch_peak, device_peak) / 1024**3  # Convert to GB
+
+
+def _poll_lowest_free_memory(
+    device: torch.device, stop: threading.Event, out: list[int]
+) -> None:
+    """Append the lowest free device memory seen until ``stop`` is set."""
+    lowest = torch.cuda.mem_get_info(device)[0]
+    while not stop.is_set():
+        lowest = min(lowest, torch.cuda.mem_get_info(device)[0])
+        time.sleep(1e-4)
+    out.append(min(lowest, torch.cuda.mem_get_info(device)[0]))
 
 
 def determine_max_batch_size(
@@ -304,7 +336,9 @@ def _n_edges_scalers(state: SimState, cutoff: float) -> list[float]:
 
 def calculate_memory_scalers(
     state: SimState,
-    memory_scales_with: MemoryScaling = "n_atoms_x_density",
+    memory_scales_with: "MemoryScaling | Literal['measured'] | MemoryModel" = (
+        "n_atoms_x_density"
+    ),
     cutoff: float = 6.0,
 ) -> list[float]:
     """Calculate a metric that estimates memory requirements for each system in a state.
@@ -403,9 +437,239 @@ def calculate_memory_scalers(
         return scalers
     if memory_scales_with == "n_edges":
         return _n_edges_scalers(state, cutoff)
+    return _fitted_memory_scalers(state, memory_scales_with)
+
+
+def _fitted_memory_scalers(state: SimState, memory_scales_with: object) -> list[float]:
+    """Return MiB predicted by a fitted :class:`MemoryModel`, or raise."""
+    if isinstance(memory_scales_with, MemoryModel):
+        return memory_scales_with.predict(state)
+    if memory_scales_with == "measured":
+        raise ValueError(
+            'memory_scales_with="measured" must be fitted first; use fit_memory_model'
+        )
     raise ValueError(
-        f"Invalid metric: {memory_scales_with}, must be one of {get_args(MemoryScaling)}"
+        f"Invalid metric: {memory_scales_with}, must be one of "
+        f"{(*get_args(MemoryScaling), 'measured')} or a MemoryModel"
     )
+
+
+@dataclass(frozen=True)
+class MemoryModel:
+    """Fitted GPU memory per system: ``const + per_atom * n_atoms + per_edge * n_edges``.
+
+    Used as ``memory_scales_with`` it makes memory scalers predicted MiB, so a
+    ``max_memory_scaler`` in MiB is a real memory budget. Obtain one from
+    :func:`fit_memory_model`.
+
+    Attributes:
+        const (float): MiB every system costs regardless of size.
+        per_atom (float): MiB per atom.
+        per_edge (float): MiB per neighbor-list edge within ``cutoff``.
+        cutoff (float): Neighbor-list cutoff in Angstrom used to count edges.
+    """
+
+    const: float
+    per_atom: float
+    per_edge: float
+    cutoff: float
+
+    def predict(self, state: SimState) -> list[float]:
+        """Return the predicted MiB for each system in ``state``."""
+        n_atoms = state.n_atoms_per_system.double().cpu()
+        if self.per_edge > 0:
+            n_edges = torch.tensor(
+                _n_edges_scalers(state, self.cutoff), dtype=n_atoms.dtype
+            )
+        else:
+            n_edges = torch.zeros_like(n_atoms)
+        cost = self.const + self.per_atom * n_atoms + self.per_edge * n_edges
+        return cost.tolist()
+
+
+def _nonnegative_least_squares(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Solve ``min |a x - b|`` with ``x >= 0`` by trying every column subset.
+
+    Exact and cheap for the three columns used here, so no solver dependency.
+    """
+    n_cols = a.shape[1]
+    best, best_residual = torch.zeros(n_cols, dtype=a.dtype), float(b.norm())
+    for size in range(1, n_cols + 1):
+        for cols in combinations(range(n_cols), size):
+            sub = a[:, list(cols)]
+            x_sub = torch.linalg.lstsq(sub, b.unsqueeze(1)).solution.squeeze(1)
+            if (x_sub < 0).any():
+                continue
+            residual = float((sub @ x_sub - b).norm())
+            if residual < best_residual - 1e-12:
+                best = torch.zeros(n_cols, dtype=a.dtype)
+                best[list(cols)] = x_sub
+                best_residual = residual
+    return best
+
+
+def _reference_systems(n_atoms: torch.Tensor, n_edges: torch.Tensor) -> list[int]:
+    """Pick systems spanning the size and edges-per-atom extremes of a job."""
+    edges_per_atom = (n_edges + 1) / n_atoms
+    order = torch.argsort(n_edges)
+    picks = [
+        int(order[0]),
+        int(order[-1]),
+        int(order[len(order) // 2]),
+        int(torch.argmax(n_atoms)),
+        int(torch.argmin(edges_per_atom)),
+        int(torch.argmax(edges_per_atom)),
+    ]
+    return list(dict.fromkeys(picks))
+
+
+def _free_device_mib(device: torch.device) -> float:
+    """Return free device memory in MiB after releasing PyTorch's cache."""
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+    return torch.cuda.mem_get_info(device)[0] / 1024**2
+
+
+def _per_copy_cost_mib(
+    state: SimState,
+    model: ModelInterface,
+    free_mib: float,
+    max_atoms: int,
+    oom_error_message: Sequence[str],
+) -> tuple[float, float]:
+    """Measure one system's per-copy MiB and the batch's fixed MiB from two batch sizes.
+
+    The larger batch grows until the copies add a tenth of ``free_mib``, aiming for a
+    quarter, so a fixed per-batch cost cannot hide the per-copy slope of small systems.
+    It is halved on out-of-memory.
+    """
+    allocated = torch.cuda.memory_allocated(state.device) / 1024**2
+    max_copies = max(2, max_atoms // state.n_atoms)
+
+    def batch_mib(n_copies: int) -> float:
+        batch = ts.concatenate_states([state] * n_copies)
+        try:
+            return measure_model_memory_forward(batch, model) * 1024 - allocated
+        finally:
+            del batch
+            if torch.cuda.is_available():  # pragma: no cover
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+    single = batch_mib(1)
+    n_copies, per_copy = min(8, max_copies), 0.0
+    while True:
+        try:
+            added = batch_mib(n_copies) - single
+        except Exception as exc:
+            if n_copies <= 2 or not any(msg in str(exc) for msg in oom_error_message):
+                raise
+            max_copies = n_copies = max(2, n_copies // 2)
+            continue
+        per_copy = max(added / (n_copies - 1), 0.0)
+        if added >= 0.1 * free_mib or n_copies >= max_copies:
+            break
+        target = int(0.25 * free_mib / max(per_copy, 1e-3)) + 1
+        n_copies = min(max_copies, max(2 * n_copies, target))
+    return per_copy, max(single - per_copy, 0.0)
+
+
+def fit_memory_model(
+    state: SimState,
+    model: ModelInterface,
+    *,
+    cutoff: float = 6.0,
+    max_memory_padding: float = 1.0,
+    max_atoms: int = 500_000,
+    oom_error_message: str | Sequence[str] = DEFAULT_OOM_ERROR_MESSAGES,
+) -> tuple[MemoryModel, float]:
+    """Fit a :class:`MemoryModel` to measured GPU memory and return it with a budget.
+
+    A handful of reference systems spanning the job's size and density extremes
+    are each run at two batch sizes, which gives their per-copy memory. A
+    non-negative fit of ``const + per_atom * n_atoms + per_edge * n_edges`` to those
+    costs is then scaled up until it covers every reference, so predictions do
+    not undershoot inside the measured range.
+
+    Unlike :func:`estimate_max_memory_scaler`, no proportional metric is assumed:
+    a per-system constant (as in UMA's mixture-of-experts layers) makes small
+    systems cost more per atom or edge than large ones, and a proportional
+    metric then caps the budget below the largest system.
+
+    Args:
+        state (SimState): Batched state of every system to be run.
+        model (ModelInterface): Model whose memory is measured, on a CUDA device.
+        cutoff (float): Neighbor-list cutoff in Angstrom for counting edges.
+        max_memory_padding (float): Fraction of the free device memory to budget.
+        max_atoms (int): Upper limit on atoms in any calibration batch.
+        oom_error_message (str | list[str]): Substrings that mark an out-of-memory
+            error during calibration.
+
+    Returns:
+        tuple[MemoryModel, float]: The fitted model, and the budget in MiB to use
+        as ``max_memory_scaler``.
+    """
+    if isinstance(oom_error_message, str):
+        oom_error_message = [oom_error_message]
+    n_atoms = state.n_atoms_per_system.double().cpu()
+    n_edges = torch.tensor(_n_edges_scalers(state, cutoff), dtype=torch.float64)
+
+    free_mib = _free_device_mib(state.device)
+    refs = _reference_systems(n_atoms, n_edges)
+    costs, fixed = [], []
+    for idx in refs:
+        per_copy, batch_fixed = _per_copy_cost_mib(
+            state[idx], model, free_mib, max_atoms, oom_error_message
+        )
+        costs.append(per_copy)
+        fixed.append(batch_fixed)
+    design = torch.stack(
+        [torch.ones(len(refs), dtype=torch.float64), n_atoms[refs], n_edges[refs]], dim=1
+    )
+    cost = torch.tensor(costs, dtype=torch.float64)
+    coef = _nonnegative_least_squares(design, cost)
+    predicted = design @ coef
+    scale = float((cost / predicted.clamp_min(1e-9)).max().clamp_min(1.0))
+    coef = coef * scale
+
+    memory_model = MemoryModel(
+        const=float(coef[0]),
+        per_atom=float(coef[1]),
+        per_edge=float(coef[2]),
+        cutoff=cutoff,
+    )
+    budget = (free_mib - max(fixed)) * max_memory_padding
+    logger.info(
+        "Fitted memory model on %d reference systems: %.3g MiB + %.3g MiB/atom + "
+        "%.3g MiB/edge (scaled x%.2f), budget %.0f MiB",
+        len(refs),
+        memory_model.const,
+        memory_model.per_atom,
+        memory_model.per_edge,
+        scale,
+        budget,
+    )
+    return memory_model, budget
+
+
+def _fit_measured_memory_model(
+    batcher: "BinningAutoBatcher | InFlightAutoBatcher", state: SimState
+) -> None:
+    """Replace ``memory_scales_with="measured"`` by a fitted model; set the budget."""
+    if not (
+        isinstance(batcher.memory_scales_with, str)
+        and batcher.memory_scales_with == "measured"
+    ):
+        return
+    batcher.memory_scales_with, budget = fit_memory_model(
+        state,
+        batcher.model,
+        cutoff=batcher.cutoff,
+        max_memory_padding=batcher.max_memory_padding,
+        max_atoms=batcher.max_atoms_to_try,
+        oom_error_message=batcher.oom_error_message,
+    )
+    batcher.max_memory_scaler = batcher.max_memory_scaler or budget
 
 
 def estimate_max_memory_scaler(
@@ -518,7 +782,9 @@ class BinningAutoBatcher[T: SimState]:
         self,
         model: ModelInterface,
         *,
-        memory_scales_with: MemoryScaling = "n_atoms_x_density",
+        memory_scales_with: "MemoryScaling | Literal['measured'] | MemoryModel" = (
+            "n_atoms_x_density"
+        ),
         cutoff: float = 6.0,
         max_memory_scaler: float | None = None,
         max_atoms_to_try: int = 500_000,
@@ -537,6 +803,11 @@ class BinningAutoBatcher[T: SimState]:
                 - "n_atoms_x_density": Uses atom count multiplied by number density
                 - "n_edges": Uses actual neighbor list edge count; most accurate overall
                   but more expensive; strongly recommended for molecular systems
+                - "measured": Fits a :class:`MemoryModel` (per-system constant plus
+                  per-atom and per-edge MiB) to forward passes on the loaded states;
+                  scalers and an unset ``max_memory_scaler`` are then in MiB. Use it
+                  when system sizes vary widely, for example small and large molecules
+                - a :class:`MemoryModel` from an earlier fit, reused without probing
                 Defaults to "n_atoms_x_density".
             cutoff (float): Neighbor list cutoff in Angstroms. Only used when
                 memory_scales_with="n_edges". Should match the model's cutoff.
@@ -600,6 +871,7 @@ class BinningAutoBatcher[T: SimState]:
         batched = (
             states if isinstance(states, SimState) else ts.concatenate_states(states)
         )
+        _fit_measured_memory_model(self, batched)
         self.memory_scalers = calculate_memory_scalers(
             batched, self.memory_scales_with, self.cutoff
         )
@@ -819,7 +1091,9 @@ class InFlightAutoBatcher[T: SimState]:
         self,
         model: ModelInterface,
         *,
-        memory_scales_with: MemoryScaling = "n_atoms_x_density",
+        memory_scales_with: "MemoryScaling | Literal['measured'] | MemoryModel" = (
+            "n_atoms_x_density"
+        ),
         cutoff: float = 6.0,
         max_memory_scaler: float | None = None,
         max_atoms_to_try: int = 500_000,
@@ -839,6 +1113,11 @@ class InFlightAutoBatcher[T: SimState]:
                 - "n_atoms_x_density": Uses atom count multiplied by number density
                 - "n_edges": Uses actual neighbor list edge count; most accurate overall
                   but more expensive; strongly recommended for molecular systems
+                - "measured": Fits a :class:`MemoryModel` (per-system constant plus
+                  per-atom and per-edge MiB) to forward passes on the loaded states;
+                  scalers and an unset ``max_memory_scaler`` are then in MiB. Use it
+                  when system sizes vary widely, for example small and large molecules
+                - a :class:`MemoryModel` from an earlier fit, reused without probing
                 Defaults to "n_atoms_x_density".
             cutoff (float): Neighbor list cutoff in Angstroms. Only used when
                 memory_scales_with="n_edges". Should match the model's cutoff.
@@ -904,6 +1183,16 @@ class InFlightAutoBatcher[T: SimState]:
             This method resets the current state indices and completed state tracking,
             so any ongoing processing will be restarted when this method is called.
         """
+        if self.memory_scales_with == "measured":
+            if isinstance(states, Iterator):
+                raise ValueError(
+                    'memory_scales_with="measured" needs every state up front, '
+                    "not an iterator"
+                )
+            batched = (
+                states if isinstance(states, SimState) else ts.concatenate_states(states)
+            )
+            _fit_measured_memory_model(self, batched)
         if isinstance(states, SimState):
             states = states.split()
         self.states_iterator = iter(states)
@@ -990,7 +1279,9 @@ class InFlightAutoBatcher[T: SimState]:
         # we need to sample a state and use it to estimate the max metric
         # for the first batch
         first_state = next(self.states_iterator)
-        first_metric = calculate_memory_scalers(first_state, self.memory_scales_with)[0]
+        first_metric = calculate_memory_scalers(
+            first_state, self.memory_scales_with, self.cutoff
+        )[0]
         self.current_scalers += [first_metric]
         self.current_idx += [0]
         self.iteration_count.append(0)  # Initialize attempt counter for first state
